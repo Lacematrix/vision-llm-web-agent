@@ -126,7 +126,7 @@ class VLLMClient:
             elif isinstance(cleaned_message.get('content'), str):
                 # Text content - check if it contains base64 image data
                 content = cleaned_message['content']
-                if 'data:image/' in content and 'base64,' in content:
+                if content and 'data:image/' in content and 'base64,' in content:
                     # Replace base64 image data with placeholder
                     import re
                     cleaned_content = re.sub(
@@ -136,72 +136,74 @@ class VLLMClient:
                     )
                     cleaned_message['content'] = cleaned_content
             
+            # Handle tool_calls if present (function calling format)
+            if 'tool_calls' in cleaned_message:
+                cleaned_message['tool_calls'] = cleaned_message['tool_calls']  # Keep as is
+            
             cleaned_messages.append(cleaned_message)
         
         return cleaned_messages
 
-    def build_system_prompt(self, available_tools: List[Dict[str, Any]]) -> str:
+    def build_system_prompt(self) -> str:
         """
-        Build system prompt with tool descriptions.
-        
-        Args:
-            available_tools: List of tool definitions
+        Build system prompt without tool descriptions.
         
         Returns:
             System prompt string
         """
         prompt = """You are an autonomous web agent. Your job is to complete tasks by controlling a web browser and using available tools.
 
-**Available Tools:**
-"""
-        
-        for tool in available_tools:
-            prompt += f"\n{tool['name']}: {tool['description']}\n"
-            if tool.get('parameters'):
-                prompt += f"Parameters: {json.dumps(tool['parameters'], indent=2)}\n"
-        
-        prompt += """
 **Input Format:**
 You will receive:
 - Screenshot (if available)
 - Current state in JSON format with: round, screenshot_available, dom_summary, instruction
-- Tool execution results in JSON format: {"tool_execution": "tool_name", "result": "result_text"}
-
-**Response Format (MUST be valid JSON):**
-
-To use a tool:
-```json
-{
-    "thought": "What I'm doing and why",
-    "tool": "tool_name",
-    "parameters": {"param": "value"}
-}
-```
-
-When task is complete:
-```json
-{
-    "thought": "Summary of what was accomplished",
-    "status": "complete",
-    "result": "Final answer for the user"
-}
-```
+- Tool execution results from previous actions
 
 **Rules:**
-1. Respond ONLY with valid JSON (start with {, end with })
-2. Call ONE tool at a time
-3. **CRITICAL: Trust DOM over screenshot** - If an element is not in dom_summary, it's NOT clickable, even if you see it in the screenshot
-4. Use specific CSS selectors for click/type actions
-5. If there is a CAPTCHA, try another site, DO NOT try to solve the CAPTCHA.
-6. **Error Recovery:** If actions fail 2+ times, try different approaches - never repeat the exact same action more than 2 times
-7. Call download_pdf for pdf download.
-8. **File Paths:** For all file operations (download_pdf, pdf_extract_text, pdf_extract_images, save_image, write_text), provide ONLY the filename (e.g., "abc.pdf", "output.txt"), NOT directory paths. The system will automatically save files to artifacts/ directory in a single level (artifacts/filename).
+1. Call ONE tool at a time using the function calling mechanism
+2. **CRITICAL: Trust DOM over screenshot** - If an element is not in dom_summary, it's NOT clickable, even if you see it in the screenshot
+3. Use specific CSS selectors for click/type actions
+4. If there is a CAPTCHA, try another site, DO NOT try to solve the CAPTCHA.
+5. **Error Recovery:** If actions fail 2+ times, try different approaches - never repeat the exact same action more than 2 times
+6. Call download_pdf for pdf download.
+7. **File Paths:** For all file operations (download_pdf, pdf_extract_text, pdf_extract_images, save_image, write_text), provide ONLY the filename (e.g., "abc.pdf", "output.txt"), NOT directory paths. The system will automatically save files to artifacts/ directory in a single level (artifacts/filename).
 
 **Preferences:**
 1. Prefer arXiv for academic and technical reports.
+
+When task is complete, respond with a normal message (not a function call) summarizing what was accomplished.
 """
         
         return prompt
+    
+    def convert_tools_to_openai_format(self, available_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Convert tool definitions to OpenAI function calling format.
+        
+        Args:
+            available_tools: List of tool definitions
+        
+        Returns:
+            List of tools in OpenAI format
+        """
+        openai_tools = []
+        
+        for tool in available_tools:
+            openai_tool = {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool.get("parameters", {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    })
+                }
+            }
+            openai_tools.append(openai_tool)
+        
+        return openai_tools
     
     def plan_next_action(
         self, 
@@ -220,16 +222,19 @@ When task is complete:
         Returns:
             Parsed response with action to take
         """
-        # Build prompt with tool descriptions
-        system_prompt = self.build_system_prompt(available_tools)
+        # Build system prompt without tool descriptions
+        system_prompt = self.build_system_prompt()
+        
+        # Convert tools to OpenAI format
+        openai_tools = self.convert_tools_to_openai_format(available_tools)
         
         # Prepare messages
         messages = [{"role": "system", "content": system_prompt}]
         
         # Add history
-        # History now contains alternating assistant (tool call) and user (tool result) messages
+        # History now contains assistant (tool calls) and tool (results) messages
         for msg in history:
-            if msg['role'] in ['user', 'assistant']:
+            if msg['role'] in ['user', 'assistant', 'tool']:
                 messages.append(msg)
         
         # Add current state with vision input (if screenshot available)
@@ -289,36 +294,89 @@ When task is complete:
             else:
                 print(f"   [{i}] {msg['role']}: {str(msg['content'])[:200]}...")
         
-        # Call the model
+        # Call the model with function calling
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
+                tools=openai_tools,
+                tool_choice="auto",  # Let the model decide when to call tools
                 max_tokens=self.max_tokens,
                 temperature=self.temperature
             )
             
-            # Parse response
-            content = response.choices[0].message.content
+            # Parse response - check for tool calls first
+            message = response.choices[0].message
             
             # Debug: Print raw VLLM output
             print(f"\n🔍 VLLM Raw Output:")
             print("=" * 80)
-            print(content)
+            if message.tool_calls:
+                print(f"Tool calls: {len(message.tool_calls)}")
+                for tc in message.tool_calls:
+                    print(f"  - {tc.function.name}: {tc.function.arguments}")
+            else:
+                print(f"Content: {message.content}")
             print("=" * 80)
             
-            # Parse and debug the result
-            parsed_result = self.parse_response(content)
+            # Check if model called tools
+            if message.tool_calls:
+                # Extract tool calls
+                tool_calls = []
+                for tool_call in message.tool_calls:
+                    try:
+                        params = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        params = {}
+                    
+                    tool_calls.append({
+                        "id": tool_call.id,
+                        "name": tool_call.function.name,
+                        "params": params
+                    })
+                
+                parsed_result = {
+                    "is_complete": False,
+                    "tool_calls": tool_calls,
+                    "thought": message.content if message.content else "Using function calling",
+                    "raw_response": str(message.tool_calls)
+                }
+            else:
+                # No tool calls - check if task is complete
+                content = message.content or ""
+                
+                # If model responds with text, assume task is complete
+                parsed_result = {
+                    "is_complete": True,
+                    "final_answer": content,
+                    "thought": "Task completed (no tool calls)",
+                    "raw_response": content
+                }
             
             # Add raw input and output to parsed result
             parsed_result["vllm_raw_input"] = {
                 "model": self.model,
                 "messages": self.clean_messages_for_logging(messages),
+                "tools": openai_tools,
+                "tool_choice": "auto",
                 "max_tokens": self.max_tokens,
                 "temperature": self.temperature
             }
             parsed_result["vllm_raw_output"] = {
-                "content": content,
+                "message": {
+                    "role": message.role,
+                    "content": message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": tc.type,
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
+                        } for tc in message.tool_calls
+                    ] if message.tool_calls else None
+                },
                 "response_object": {
                     "id": response.id,
                     "object": response.object,

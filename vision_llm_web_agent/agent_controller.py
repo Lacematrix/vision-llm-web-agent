@@ -308,18 +308,22 @@ class Agent:
         for tool_call in tool_calls:
             tool_name = tool_call["name"]
             parameters = tool_call.get("params", {})
+            tool_call_id = tool_call.get("id", f"call_{round_num}_{tool_name}")
             
             print(f"🔧 Executing: {tool_name}({json.dumps(parameters, indent=2)})")
             
-            # First, add assistant's tool call decision to history
-            assistant_tool_call = {
-                "thought": response.get("thought", ""),
-                "tool": tool_name,
-                "parameters": parameters
-            }
+            # Add assistant's tool call message to history (function calling format)
             self.history.append({
                 "role": "assistant",
-                "content": json.dumps(assistant_tool_call, ensure_ascii=False, indent=2)
+                "content": None,
+                "tool_calls": [{
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(parameters, ensure_ascii=False)
+                    }
+                }]
             })
             
             # Execute with timeout
@@ -330,14 +334,12 @@ class Agent:
                 result = f"❌ Tool execution error: {e}"
                 print(f"   {result}")
             
-            # Add tool execution result as user message to history
-            tool_result = {
-                "tool_execution": tool_name,
-                "result": result
-            }
+            # Add tool execution result as tool message to history (function calling format)
             self.history.append({
-                "role": "user",
-                "content": json.dumps(tool_result, ensure_ascii=False, indent=2)
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "name": tool_name,
+                "content": result
             })
             
             # Log execution with VLLM raw data
