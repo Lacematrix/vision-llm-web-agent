@@ -10,27 +10,36 @@ class SemanticDOMAnalyzer:
         }
 
     def extract_dom_from_page(self, page):
-        """直接从 playwright 的 page 提取交互元素"""
-        html = page.content()  # 同步获取完整 DOM
+        """直接从 playwright 的 page 提取交互元素，附带可操作定位器"""
+        html = page.content()
         soup = BeautifulSoup(html, 'html.parser')
         elements = []
 
-        for el in soup.find_all(True):  # 遍历所有标签
+        for el in soup.find_all(True):
             tag = el.name
             text = el.get_text(strip=True)[:80]
             attrs = {k: v for k, v in el.attrs.items() if isinstance(v, (str, list))}
             role = el.attrs.get("role", "").lower()
 
-            # 判断是否为交互元素
             if self.is_interactive(el, tag, role):
+                # 生成 selector
+                selector = ""
+                if "id" in attrs:
+                    selector = f"#{attrs['id']}"
+                elif "class" in attrs:
+                    classes = ".".join(attrs["class"])
+                    selector = f"{tag}.{classes}"
+                else:
+                    selector = tag  # fallback
+
                 elements.append({
                     "tag": tag,
                     "text": text,
                     "attributes": attrs,
                     "role": role,
+                    "selector": selector,
                     "semantic": self.analyze_semantic(el, tag, text, attrs, role)
                 })
-
         return elements
 
     def is_interactive(self, el, tag, role):
@@ -64,21 +73,39 @@ class SemanticDOMAnalyzer:
             return {"type": "advertisement", "hint": "⚠️ 广告内容"}
         if tag == "a" or role == "navigation":
             return {"type": "navigation_link", "hint": "🧭 点击导航"}
+        if all(k in lower_text for k in ["nav", "btn"]):
+            return {"type": "navigation_btn", "hint": "🧭 导航按钮"}
         return {"type": "unknown", "hint": f"🎯 与 {tag} 交互"}
 
-    def to_llm_representation(self, elements):
-        """转为 LLM 可读文本"""
+    def to_llm_representation(self, elements, max_elements=20):
+        """转为 LLM 可读文本，附带可直接调用 tool 的信息"""
+        elements_count = {}
         lines = []
+        count = 0
         for i, el in enumerate(elements, 1):
-            desc = f"[{i}] <{el['tag']}> ({el['semantic']['type']}) {el['text'][:50]}"
-            hint = f" → {el['semantic']['hint']}"
-            lines.append(desc + hint)
+            # 描述元素
+            if (el['semantic']['type']) not in elements_count:
+                elements_count[el['semantic']['type']] = 0
+            if elements_count[el['semantic']['type']] < max_elements:
+                elements_count[el['semantic']['type']] += 1
+                count += 1
+                desc = f"[{count}] <{el['tag']}> ({el['semantic']['type']}) {el['text'][:50]}"
+                hint = f" → {el['semantic']['hint']}"
+                
+                # tool 调用建议
+                tool_suggestion = ""
+                if el['tag'] in ["input", "textarea", "select"]:
+                    tool_suggestion = f"tool:type_text(selector='{el['selector']}'')"
+                elif el['tag'] in ["button", "a"] or el['semantic']['type'] in ["play_button", "submit_button", "download_button"]:
+                    tool_suggestion = f"tool:click(text='{el['text']}')"
+
+                lines.append(desc + hint + " | " + tool_suggestion)
         return "\n".join(lines)
 
-    def analyze_page(self, page):
+    def analyze_page(self, page, max_elements=20):
         """主入口：分析已有 page 对象"""
         elements = self.extract_dom_from_page(page)
-        text_repr = self.to_llm_representation(elements)
+        text_repr = self.to_llm_representation(elements, max_elements=max_elements)
         return {
             "elements": elements,
             "llm_text": text_repr

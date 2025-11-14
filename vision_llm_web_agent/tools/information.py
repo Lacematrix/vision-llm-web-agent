@@ -49,7 +49,7 @@ def get_dom_summary(max_elements: int = 50) -> str:
         return "❌ Browser not initialized. Call goto() first."
     
     try:
-        return semantic_dom_analyzer.analyze_page(browser_state.page)['llm_text']
+        return semantic_dom_analyzer.analyze_page(browser_state.page, max_elements=5)['llm_text']
         # JavaScript to extract interactive elements with better organization
         # dom_script = """
         # () => {

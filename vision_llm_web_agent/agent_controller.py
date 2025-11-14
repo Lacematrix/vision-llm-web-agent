@@ -224,7 +224,7 @@ class Agent:
         print("🤔 VLLM planning next action...")
         state_info = {
             "screenshot": screenshot_path if screenshot_available else None,
-            "dom": dom[:2000],  # Limit DOM length
+            "dom": dom,  # Limit DOM length
             "round": round_num,
             "screenshot_available": screenshot_available
         }
