@@ -9,6 +9,7 @@ license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "langchain-openai>=0.3.0",
     "openai>=2.3.0",
     "pillow>=11.3.0",
     "playwright>=1.55.0",

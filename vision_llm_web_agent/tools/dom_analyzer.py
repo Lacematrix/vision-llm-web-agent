@@ -3,6 +3,7 @@ import json
 from typing import Optional
 from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
+from ..prompts import build_dom_filter_system_prompt, build_dom_filter_user_prompt
 
 class SemanticDOMAnalyzer:
     def __init__(self):
@@ -172,13 +173,7 @@ class SemanticDOMAnalyzer:
             all_elements[el['tag']].append(el)
         
         filtered_elements = []
-        system_prompt = (
-            "You are an HTML element filter helping a downstream web agent. Share only the "
-            "most relevant interactive elements such as search inputs, navigation links, "
-            "and buttons. Keep div elements with nav/search semantics when useful. The user "
-            "will provide a question and a structured element list. Return the indexes of up "
-            f"to max = {max_elements} elements in the format ```json [1,3,5]``` and nothing else."
-        )
+        system_prompt = build_dom_filter_system_prompt(max_elements)
         for tag in input_elements:
             if(len(input_elements[tag])<=max_elements):
                 # print(f"✅ Selected all <{tag}> elements because count {len(input_elements[tag])} <= {max_elements}")
@@ -187,7 +182,10 @@ class SemanticDOMAnalyzer:
             input_prompt = "\n".join(input_elements[tag])
             message = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"{user_prompt}\n\nHere are the <{tag}> elements on the page:\n{input_prompt}"}
+                {
+                    "role": "user",
+                    "content": build_dom_filter_user_prompt(user_prompt, tag, input_prompt),
+                }
             ]
             response = client.chat.completions.create(
                 model=model,

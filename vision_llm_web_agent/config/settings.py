@@ -42,6 +42,9 @@ OPENAI_LANGUAGE_MODEL = os.getenv("OPENAI_LANGUAGE_MODEL", "gpt-4o")
 # Agent Configuration
 MAX_ROUNDS = int(os.getenv("MAX_ROUNDS", "50"))  # Increased default from 20 to 50
 TIMEOUT_PER_ROUND = int(os.getenv("TIMEOUT_PER_ROUND", "30"))
+MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "32000"))
+KEEP_LAST_MESSAGES = int(os.getenv("KEEP_LAST_MESSAGES", "12"))
+MAX_CONTEXT_SUMMARY_CHARS = int(os.getenv("MAX_CONTEXT_SUMMARY_CHARS", "1200"))
 
 # Browser Configuration
 BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "false").lower() == "true"

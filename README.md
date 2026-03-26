@@ -1,6 +1,6 @@
 # Vision-LLM Web Agent
 
-An autonomous web agent powered by Vision Language Models and Playwright that executes natural language instructions through multi-round interaction. Supports using vision language models through OpenAI-compatible APIs (can be local or remote).
+An autonomous web agent powered by Vision Language Models, LangChain, and Playwright that executes natural language instructions through multi-round interaction. Supports using vision language models through OpenAI-compatible APIs (can be local or remote).
 
 ## 🚀 Quick Start
 

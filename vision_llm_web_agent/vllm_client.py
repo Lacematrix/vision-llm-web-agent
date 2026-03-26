@@ -11,16 +11,33 @@ from pathlib import Path
 from typing import Optional, Dict, List, Any
 
 from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from openai import OpenAI
 from PIL import Image
-from .config.settings import ARTIFACTS_DIR
+from .config.settings import (
+    ARTIFACTS_DIR,
+    KEEP_LAST_MESSAGES,
+    MAX_CONTEXT_SUMMARY_CHARS,
+    MAX_HISTORY_CHARS,
+)
+from .context_manager import ContextWindowManager
+from .prompts import (
+    build_agent_system_prompt,
+    build_context_compression_prompt,
+    build_current_state_message,
+    build_json_retry_feedback,
+    build_local_file_processing_note,
+    build_text_summary_prompt,
+    build_web_browsing_instruction,
+)
 
 # Load environment variables
 load_dotenv()
 
 
 class VLLMClient:
-    """Client for Vision Language Models via OpenAI-compatible API"""
+    """Client for Vision Language Models via LangChain and OpenAI-compatible APIs."""
     
     def __init__(
         self, 
@@ -58,10 +75,40 @@ class VLLMClient:
             base_url=self.base_url,
             api_key=self.api_key
         )
+
+        # LangChain model for agent planning while preserving the existing OpenAI
+        # client interface used by DOM analyzer utilities.
+        self.langchain_llm = ChatOpenAI(
+            model=self.model,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature
+        )
         
         print(f"✅ VLLM Client initialized")
         print(f"   Base URL: {self.base_url}")
         print(f"   Model: {self.model}")
+
+        self.context_manager = ContextWindowManager(
+            max_history_chars=MAX_HISTORY_CHARS,
+            keep_last_messages=KEEP_LAST_MESSAGES,
+            max_summary_chars=MAX_CONTEXT_SUMMARY_CHARS,
+        )
+
+    def _to_langchain_messages(self, messages: List[Dict[str, Any]]) -> List[Any]:
+        """Convert OpenAI-style message dicts to LangChain message objects."""
+        lc_messages: List[Any] = []
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role == "system":
+                lc_messages.append(SystemMessage(content=content))
+            elif role == "assistant":
+                lc_messages.append(AIMessage(content=content))
+            else:
+                lc_messages.append(HumanMessage(content=content))
+        return lc_messages
     
     def encode_image(self, image_path: str, max_size: tuple = (1280, 720)) -> str:
         """
@@ -144,68 +191,18 @@ class VLLMClient:
         return cleaned_messages
 
     def build_system_prompt(self, available_tools: List[Dict[str, Any]]) -> str:
-        """
-        Build system prompt with tool descriptions.
-        
-        Args:
-            available_tools: List of tool definitions
-        
-        Returns:
-            System prompt string
-        """
-        prompt = """You are an autonomous web agent. Your job is to complete tasks by controlling a web browser and using available tools.
+        """Build system prompt with tool descriptions."""
+        return build_agent_system_prompt(available_tools)
 
-**Available Tools:**
-"""
-        
-        for tool in available_tools:
-            prompt += f"\n{tool['name']}: {tool['description']}\n"
-            if tool.get('parameters'):
-                prompt += f"Parameters: {json.dumps(tool['parameters'], indent=2)}\n"
-        
-        prompt += """
-**Input Format:**
-You will receive:
-- Screenshot (if available)
-- Current state in JSON format with: round, screenshot_available, dom_summary, instruction
-- Tool execution results in JSON format: {"tool_execution": "tool_name", "result": "result_text"}
-
-**Response Format (MUST be valid JSON):**
-
-To use a tool:
-```json
-{
-    "thought": "What I'm doing and why",
-    "tool": "tool_name",
-    "parameters": {"param": "value"},
-    "next": "If task is not fully complete, what to do next"
-}
-```
-
-When task is complete:
-```json
-{
-    "thought": "Summary of what was accomplished",
-    "status": "complete",
-    "result": "Final answer for the user"
-}
-```
-
-**Rules:**
-1. Respond ONLY with valid JSON (start with {, end with })
-2. Call ONE tool at a time
-3. **CRITICAL: Trust DOM over screenshot** - If an element is not in dom_summary, it's NOT clickable, even if you see it in the screenshot
-4. Use specific CSS selectors for click/type actions
-5. If there is a CAPTCHA, try another site, DO NOT try to solve the CAPTCHA.
-6. **Error Recovery:** If actions fail 2+ times, try different approaches - never repeat the exact same action more than 2 times
-7. Call download_pdf for pdf download.
-8. **File Paths:** For all file operations (download_pdf, pdf_extract_text, pdf_extract_images, save_image, write_text), provide ONLY the filename (e.g., "abc.pdf", "output.txt"), NOT directory paths. The system will automatically save files to artifacts/ directory in a single level (artifacts/filename).
-
-**Preferences:**
-1. Prefer arXiv for academic and technical reports.
-"""
-        
-        return prompt
+    def _summarize_for_context_compression(self, history_text: str, max_length: int) -> str:
+        """Summarize history chunks to fit context window constraints."""
+        try:
+            prompt = build_context_compression_prompt(history_text, max_length)
+            response = self.langchain_llm.invoke([HumanMessage(content=prompt)])
+            content = response.content if isinstance(response.content, str) else str(response.content)
+            return content[:max_length]
+        except Exception as e:
+            return f"Summary generation failed: {e}."
     
     def plan_next_action(
         self, 
@@ -232,7 +229,17 @@ When task is complete:
         
         # Add history
         # History now contains alternating assistant (tool call) and user (tool result) messages
-        for msg in history:
+        managed_history = self.context_manager.compress_history(
+            history,
+            self._summarize_for_context_compression,
+        )
+        if len(managed_history) < len(history):
+            print(
+                f"   🗜️ Context compressed: {len(history)} -> {len(managed_history)} messages "
+                f"(history chars <= {self.context_manager.max_history_chars})"
+            )
+
+        for msg in managed_history:
             if msg['role'] in ['user', 'assistant']:
                 messages.append(msg)
         
@@ -269,7 +276,7 @@ When task is complete:
             "context_mode": context_mode,
             "screenshot_available": screenshot_available,
             "dom_summary": dom_text,
-            "instruction": state_info.get('instruction', "Analyze the current state and decide the next action. Respond with valid JSON.")
+            "instruction": state_info.get('instruction', build_web_browsing_instruction())
         }
         
         # Add PDF detection warning if PDF page detected
@@ -284,7 +291,7 @@ When task is complete:
             current_state_json["available_local_files"] = state_info.get('available_local_files', [])
             extracted_images = state_info.get('extracted_images', [])
             current_state_json["extracted_images"] = extracted_images
-            current_state_json["note"] = "You are in LOCAL FILE PROCESSING mode. Use pdf_extract_text, pdf_extract_images, ocr_image_to_text tools. Ignore screenshot/DOM."
+            current_state_json["note"] = build_local_file_processing_note()
             
             # Add extracted images to VLLM input so it can "see" them
             # Add images BEFORE text content so VLLM can see them first
@@ -327,7 +334,9 @@ When task is complete:
         
         current_state_content.append({
             "type": "text",
-            "text": f"Current State:\n```json\n{json.dumps(current_state_json, ensure_ascii=False, indent=2)}\n```"
+            "text": build_current_state_message(
+                json.dumps(current_state_json, ensure_ascii=False, indent=2)
+            )
         })
         
         messages.append({
@@ -352,15 +361,11 @@ When task is complete:
         
         # Call the model
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature
-            )
-            
-            # Parse response
-            content = response.choices[0].message.content
+            lc_messages = self._to_langchain_messages(messages)
+            response = self.langchain_llm.invoke(lc_messages)
+
+            # Parse response content
+            content = response.content if isinstance(response.content, str) else str(response.content)
             
             # Debug: Print raw VLLM output
             print(f"\n🔍 VLLM Raw Output:")
@@ -375,31 +380,19 @@ When task is complete:
             parsed_result["vllm_raw_input"] = {
                 "model": self.model,
                 "messages": self.clean_messages_for_logging(messages),
+                "history_messages_original": len(history),
+                "history_messages_used": len(managed_history),
                 "max_tokens": self.max_tokens,
                 "temperature": self.temperature
             }
             parsed_result["vllm_raw_output"] = {
                 "content": content,
                 "response_object": {
+                    "type": "langchain_ai_message",
                     "id": response.id,
-                    "object": response.object,
-                    "created": response.created,
-                    "model": response.model,
-                    "choices": [
-                        {
-                            "index": choice.index,
-                            "message": {
-                                "role": choice.message.role,
-                                "content": choice.message.content
-                            },
-                            "finish_reason": choice.finish_reason
-                        } for choice in response.choices
-                    ],
-                    "usage": {
-                        "prompt_tokens": response.usage.prompt_tokens,
-                        "completion_tokens": response.usage.completion_tokens,
-                        "total_tokens": response.usage.total_tokens
-                    } if response.usage else None
+                    "response_metadata": response.response_metadata,
+                    "usage_metadata": response.usage_metadata,
+                    "additional_kwargs": response.additional_kwargs
                 }
             }
             
@@ -424,20 +417,20 @@ When task is complete:
                 # Add error feedback as user message
                 error_feedback = {
                     "role": "user",
-                    "content": f"ERROR: Your response was not valid JSON. Please respond with valid JSON format only. Use the exact format specified in the system prompt.\n\nYour previous response:\n{content[:500]}..."
+                    "content": build_json_retry_feedback(f"{content[:500]}...")
                 }
                 
                 # Retry with error feedback
                 print(f"\n🔄 Retrying with error feedback...")
                 retry_messages = messages + [assistant_invalid_response, error_feedback]
-                retry_response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=retry_messages,
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature
+                retry_lc_messages = self._to_langchain_messages(retry_messages)
+                retry_response = self.langchain_llm.invoke(retry_lc_messages)
+
+                retry_content = (
+                    retry_response.content
+                    if isinstance(retry_response.content, str)
+                    else str(retry_response.content)
                 )
-                
-                retry_content = retry_response.choices[0].message.content
                 print(f"\n🔍 VLLM Retry Output:")
                 print("=" * 80)
                 print(retry_content)
@@ -450,31 +443,19 @@ When task is complete:
                 parsed_result["vllm_raw_input"] = {
                     "model": self.model,
                     "messages": self.clean_messages_for_logging(retry_messages),
+                    "history_messages_original": len(history),
+                    "history_messages_used": len(managed_history),
                     "max_tokens": self.max_tokens,
                     "temperature": self.temperature
                 }
                 parsed_result["vllm_raw_output"] = {
                     "content": retry_content,
                     "response_object": {
+                        "type": "langchain_ai_message",
                         "id": retry_response.id,
-                        "object": retry_response.object,
-                        "created": retry_response.created,
-                        "model": retry_response.model,
-                        "choices": [
-                            {
-                                "index": choice.index,
-                                "message": {
-                                    "role": choice.message.role,
-                                    "content": choice.message.content
-                                },
-                                "finish_reason": choice.finish_reason
-                            } for choice in retry_response.choices
-                        ],
-                        "usage": {
-                            "prompt_tokens": retry_response.usage.prompt_tokens,
-                            "completion_tokens": retry_response.usage.completion_tokens,
-                            "total_tokens": retry_response.usage.total_tokens
-                        } if retry_response.usage else None
+                        "response_metadata": retry_response.response_metadata,
+                        "usage_metadata": retry_response.usage_metadata,
+                        "additional_kwargs": retry_response.additional_kwargs
                     }
                 }
                 print(f"\n📋 Retry Parsed Result:")
@@ -600,14 +581,7 @@ When task is complete:
             # Keep first 8000 characters for summarization
             text_to_summarize = text[:8000] if len(text) > 8000 else text
             
-            prompt = f"""Please provide a concise summary of the following text. 
-The summary should be clear, informative, and capture the main points.
-Keep it under {max_length} characters.
-
-Text to summarize:
-{text_to_summarize}
-
-Summary:"""
+            prompt = build_text_summary_prompt(text_to_summarize, max_length)
             
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -629,12 +603,9 @@ Summary:"""
             True if connection successful, False otherwise
         """
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": "Hello"}],
-                max_tokens=10
-            )
-            print(f"✅ API connection successful: {response.choices[0].message.content[:50]}")
+            response = self.langchain_llm.invoke([HumanMessage(content="Hello")])
+            content = response.content if isinstance(response.content, str) else str(response.content)
+            print(f"✅ API connection successful: {content[:50]}")
             return True
         except Exception as e:
             print(f"❌ API connection failed: {e}")

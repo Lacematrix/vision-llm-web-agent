@@ -13,6 +13,21 @@ from .vllm_client import VLLMClient
 from .tools import get_tool_registry
 from .config.settings import ARTIFACTS_DIR
 from .tools.dom_analyzer import semantic_dom_analyzer
+from .prompts import (
+    build_action_blocked_message,
+    build_context_switch_message,
+    build_download_context_switch_note,
+    build_download_pdf_already_done_message,
+    build_failed_action_intervention,
+    build_forced_dom_summary_message,
+    build_history_summary_request,
+    build_history_summarize_instruction,
+    build_intervention_repeat_tool_message,
+    build_local_file_processing_instruction,
+    build_local_multi_step_reminder,
+    build_pdf_detected_instruction,
+    build_web_browsing_instruction,
+)
 
 
 class Agent:
@@ -127,7 +142,7 @@ class Agent:
             # Block download_pdf if already in local_file_processing mode
             if tool_name == "download_pdf" and self.context_mode == "local_file_processing":
                 if self.downloaded_pdf_files:
-                    return f"⚠️ PDF already downloaded! You are in LOCAL FILE PROCESSING mode. Available files: {', '.join(self.downloaded_pdf_files)}. Use pdf_extract_text/pdf_extract_images tools to process the existing PDF. DO NOT download again!"
+                    return f"⚠️ {build_download_pdf_already_done_message(self.downloaded_pdf_files)}"
                 else:
                     # Allow download if no files tracked (edge case)
                     pass
@@ -157,7 +172,7 @@ class Agent:
                             "result": result_str,
                             "context_switch": {
                                 "mode": "local_file_processing",
-                                "message": f"PDF file '{file_name}' has been successfully downloaded to local artifacts directory. You should now use local file processing tools (pdf_extract_text, pdf_extract_images, ocr_image_to_text, save_image, write_text) to process this file. These tools work on local files and do NOT require web browser operations. Ignore any screenshot/DOM information when processing local files.",
+                                "message": build_context_switch_message(file_name),
                                 "available_local_files": self.downloaded_pdf_files
                             }
                         })
@@ -370,7 +385,7 @@ class Agent:
                         # Add forced dom_summary result to history
                         forced_dom_msg = {
                             "role": "user",
-                            "content": f"🚨 FORCED ACTION: dom_summary was automatically called because '{action_key}' has failed {failure_count} times. Here is the DOM summary:\n{dom_result}\n\nYou MUST use the selectors from the INPUT FIELDS section above. DO NOT repeat the blocked action!"
+                            "content": "🚨 " + build_forced_dom_summary_message(action_key, failure_count, dom_result)
                         }
                         self.history.append(forced_dom_msg)
                         print(f"   ✅ Forced dom_summary completed and added to history")
@@ -390,7 +405,7 @@ class Agent:
             if self.original_instruction:
                 original_lower = self.original_instruction.lower()
                 if "save all" in original_lower:
-                    multi_step_reminder = "\n\n**🚨 CRITICAL - MULTI-STEP TASK DETECTED:**\nYour original task requires multiple steps. You MUST complete ALL steps before marking as complete:\n1. **FIRST:** Extract ALL images with pdf_extract_images(file_name=\"report.pdf\", output_dir=\"extracted_images\") WITHOUT page_num\n2. **SECOND:** Save all extracted images using save_image for each image\n3. **THIRD:** Find and interpret the first image (if task says 'interpret the first image')\n4. **ONLY THEN:** Mark status as \"complete\" after ALL steps are done!\n\n**DO NOT skip steps!** Check your original task requirements carefully!"
+                    multi_step_reminder = build_local_multi_step_reminder()
             
             # In local file processing mode, screenshot/DOM are not relevant
             state_info = {
@@ -401,7 +416,7 @@ class Agent:
                 "screenshot_available": False,
                 "available_local_files": self.downloaded_pdf_files,
                 "extracted_images": self.extracted_images,  # Add extracted images for VLLM visualization
-                "instruction": f"You are currently in LOCAL FILE PROCESSING mode. Use pdf_extract_text, pdf_extract_images, save_image, write_text, and ocr_image_to_text tools to process the downloaded PDF files. These tools work on local files in the artifacts/ directory. Do NOT use web browser tools (click, type_text, etc.) in this mode. DO NOT download PDF again - it's already downloaded!{multi_step_reminder}"
+                "instruction": build_local_file_processing_instruction(multi_step_reminder)
             }
             print(f"   📁 Context: Local file processing mode (available files: {self.downloaded_pdf_files})")
             if self.extracted_images:
@@ -430,14 +445,14 @@ class Agent:
                 "dom": dom,
                 "round": round_num,
                 "screenshot_available": screenshot_available,
-                "instruction": "Analyze the current state and decide the next action. Respond with valid JSON."
+                "instruction": build_web_browsing_instruction()
             }
             
             # Add PDF detection warning if PDF page detected
             if is_pdf_page:
                 state_info["pdf_detected"] = True
                 state_info["pdf_url"] = pdf_url
-                state_info["instruction"] = f"🚨 CRITICAL: PDF PAGE DETECTED! The current page is a PDF file (URL: {pdf_url}). You MUST download it using download_pdf(url=\"{pdf_url}\", file_name=\"report.pdf\") before processing. DO NOT try to scroll or interact with the PDF in the browser - download it first!"
+                state_info["instruction"] = build_pdf_detected_instruction(pdf_url)
         
         try:
             response = self.vllm.plan_next_action(
@@ -586,16 +601,22 @@ class Agent:
                 # Add intervention message
                 intervention_msg = {
                     "role": "user",
-                    "content": f"⚠️ INTERVENTION: You have called '{tool_name}' with the same parameters {repeat_count} times. The result was already provided. You MUST proceed to the next step:\n"
+                    "content": ""
                 }
                 
                 # Provide specific guidance based on tool
+                extra_guidance = ""
                 if tool_name == "pdf_extract_text":
-                    intervention_msg["content"] += "- If you extracted text to find Figure 1, check the FIGURE LOCATIONS SUMMARY and proceed to extract images.\n"
-                    intervention_msg["content"] += "- DO NOT extract text again - you already have the information you need!\n"
+                    extra_guidance += "- If you extracted text to find Figure 1, check the FIGURE LOCATIONS SUMMARY and proceed to extract images.\n"
+                    extra_guidance += "- DO NOT extract text again - you already have the information you need!\n"
                 elif tool_name == "pdf_extract_images":
-                    intervention_msg["content"] += "- Images have been extracted. You MUST now save them using save_image or proceed to interpret them.\n"
-                    intervention_msg["content"] += "- DO NOT extract images again!\n"
+                    extra_guidance += "- Images have been extracted. You MUST now save them using save_image or proceed to interpret them.\n"
+                    extra_guidance += "- DO NOT extract images again!\n"
+                intervention_msg["content"] = "⚠️ " + build_intervention_repeat_tool_message(
+                    tool_name,
+                    repeat_count,
+                    extra_guidance,
+                )
                 
                 self.history.append(intervention_msg)
                 print(f"   ✅ Added intervention message to guide next action")
@@ -629,7 +650,11 @@ class Agent:
                         # Add blocking message to history BEFORE assistant's tool call
                         blocking_msg = {
                             "role": "user",
-                            "content": f"🚨 ACTION BLOCKED: Your requested action '{original_tool_name}' with parameters {json.dumps(original_parameters)} has been blocked because it has failed {failure_count} times. The system has automatically replaced it with a dom_summary call. You MUST use the selectors from the DOM summary result. DO NOT attempt the blocked action again!"
+                            "content": "🚨 " + build_action_blocked_message(
+                                original_tool_name,
+                                json.dumps(original_parameters),
+                                failure_count,
+                            )
                         }
                         self.history.append(blocking_msg)
             
@@ -706,7 +731,12 @@ class Agent:
                             # Add a special message to history to force VLLM to check DOM
                             intervention_msg = {
                                 "role": "user",
-                                "content": f"⚠️ INTERVENTION: The action '{tool_name}' with parameters {json.dumps(parameters)} has failed {same_failures_count} times. You MUST call 'dom_summary' tool to find the correct selector before trying again. DO NOT repeat the same failed action! If this action fails {self.force_dom_summary_threshold} times, it will be automatically blocked."
+                                "content": "⚠️ " + build_failed_action_intervention(
+                                    tool_name,
+                                    json.dumps(parameters),
+                                    same_failures_count,
+                                    self.force_dom_summary_threshold,
+                                )
                             }
                             self.history.append(intervention_msg)
                             print(f"   ✅ Added intervention message to force DOM summary check")
@@ -747,7 +777,7 @@ class Agent:
                     "result": result,
                     "context_switch": {
                         "mode": "local_file_processing",
-                        "message": f"PDF file '{file_name}' has been successfully downloaded to local artifacts directory. You should now use local file processing tools (pdf_extract_text, pdf_extract_images, ocr_image_to_text) to process this file. These tools work on local files and do NOT require web browser operations. Ignore any screenshot/DOM information when processing local files.\n\n**IMPORTANT - For tasks requiring specific figures (e.g., 'interpret Figure 1'):**\n1. FIRST extract text from PDF (pdf_extract_text without page_num) to search for 'Figure 1' in the text and find which page it's on\n2. THEN extract images ONLY from that specific page (use page_num parameter)\n3. DO NOT extract images from page 1 or all pages before finding where Figure 1 is located!",
+                        "message": build_download_context_switch_note(file_name),
                         "available_local_files": [file_name]
                     }
                 }
@@ -787,19 +817,19 @@ class Agent:
         # use llm to summarize
         self.history.append({
             "role": "user",
-            "content": f"Please provide a concise summary of the following conversation history:\n\n{summary}\n\nSummary:"
+            "content": build_history_summary_request(summary)
         })
         try:
             summary = self.vllm.plan_next_action(
                 self.history,
-                {"instruction": "Summarize the conversation history concisely."},
+                {"instruction": build_history_summarize_instruction()},
                 []
             )
             if summary['is_complete'] is False:
                 # keep summarizing until complete
                 summary = self.vllm.plan_next_action(
                     self.history,
-                    {"instruction": "Summarize the conversation history concisely."},
+                    {"instruction": build_history_summarize_instruction()},
                     []
                 )
             final_answer = summary.get("final_answer", "")
